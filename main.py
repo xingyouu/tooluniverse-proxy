@@ -1,20 +1,18 @@
 from fastapi import FastAPI, Request
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import json
 import os
 
 app = FastAPI()
 
-
-class FindToolsRequest(BaseModel):
-    query: str
-    limit: int = 5
-
-
-class RunToolRequest(BaseModel):
-    tool_name: str
-    arguments: dict = {}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def check_token(request: Request):
@@ -31,7 +29,11 @@ def root():
     return {
         "status": "ok",
         "service": "tooluniverse-proxy",
-        "routes": ["/health", "/find_tools", "/run_tool"]
+        "routes": {
+            "health": "/health",
+            "find_tools": "/find_tools",
+            "run_tool": "/run_tool"
+        }
     }
 
 
@@ -40,16 +42,42 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/find_tools")
+def find_tools_get():
+    return {
+        "status": "ok",
+        "message": "find_tools endpoint is available. Use POST with JSON body.",
+        "method": "POST",
+        "example_body": {
+            "query": "EGFR drug target information",
+            "limit": 5
+        }
+    }
+
+
 @app.post("/find_tools")
-async def find_tools(request: Request):
+async def find_tools_post(request: Request):
     if not check_token(request):
         return {"error": "unauthorized"}
 
-    body = await request.json()
-    query = body.get("query") or body.get("input") or body.get("text") or str(body)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    query = (
+        body.get("query")
+        or body.get("input")
+        or body.get("text")
+        or "EGFR drug target information"
+    )
+
     limit = body.get("limit", 5)
 
     cmd = [
+        "uvx",
+        "--from",
+        "tooluniverse",
         "tu",
         "find",
         query,
@@ -66,6 +94,7 @@ async def find_tools(request: Request):
         )
 
         return {
+            "status": "ok",
             "query": query,
             "limit": limit,
             "stdout": result.stdout,
@@ -75,25 +104,43 @@ async def find_tools(request: Request):
 
     except Exception as e:
         return {
+            "status": "error",
             "query": query,
             "error": str(e)
         }
 
 
+@app.get("/run_tool")
+def run_tool_get():
+    return {
+        "status": "ok",
+        "message": "run_tool endpoint is available. Use POST with JSON body.",
+        "method": "POST",
+        "example_body": {
+            "tool_name": "Tool_Name_Here",
+            "arguments": {}
+        }
+    }
+
+
 @app.post("/run_tool")
-async def run_tool(request: Request):
+async def run_tool_post(request: Request):
     if not check_token(request):
         return {"error": "unauthorized"}
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
     tool_name = body.get("tool_name") or body.get("name")
     arguments = body.get("arguments") or body.get("args") or {}
 
     if not tool_name:
         return {
+            "status": "error",
             "error": "missing tool_name",
-            "example": {
+            "example_body": {
                 "tool_name": "Tool_Name_Here",
                 "arguments": {}
             }
@@ -102,6 +149,9 @@ async def run_tool(request: Request):
     args_json = json.dumps(arguments, ensure_ascii=False)
 
     cmd = [
+        "uvx",
+        "--from",
+        "tooluniverse",
         "tu",
         "run",
         tool_name,
@@ -117,6 +167,7 @@ async def run_tool(request: Request):
         )
 
         return {
+            "status": "ok",
             "tool_name": tool_name,
             "arguments": arguments,
             "stdout": result.stdout,
@@ -126,6 +177,7 @@ async def run_tool(request: Request):
 
     except Exception as e:
         return {
+            "status": "error",
             "tool_name": tool_name,
             "arguments": arguments,
             "error": str(e)
