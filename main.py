@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional
 import subprocess
 import json
 import os
+import shutil
 
 app = FastAPI(
     title="ToolUniverse Proxy",
@@ -12,7 +13,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# 有些平台对 OpenAPI 3.1 支持不好，强制改成 3.0.3 更稳
 app.openapi_version = "3.0.3"
 
 app.add_middleware(
@@ -41,12 +41,12 @@ class RunToolRequest(BaseModel):
     tool_name: str = Field(
         ...,
         description="Exact ToolUniverse tool name returned by find_tools.",
-        examples=["Tool_Name_Here"]
+        examples=["PubMed_search_articles"]
     )
-    arguments: Dict[str, Any] = Field(
+    arguments: Any = Field(
         default_factory=dict,
         description="JSON arguments required by the selected ToolUniverse tool.",
-        examples=[{}]
+        examples=[{"query": "EGFR cancer", "max_results": 3}]
     )
 
 
@@ -58,76 +58,142 @@ class ToolResponse(BaseModel):
     query: Optional[str] = None
     limit: Optional[int] = None
     tool_name: Optional[str] = None
-    arguments: Optional[Dict[str, Any]] = None
+    arguments: Optional[Any] = None
     error: Optional[str] = None
 
 
-def check_token(request: Request):
-    expected_token = os.getenv("PLUGIN_TOKEN")
-    if not expected_token:
-        return True
+def normalize_arguments(arguments: Any) -> Dict[str, Any]:
+    if arguments is None:
+        return {}
 
-    auth = request.headers.get("Authorization", "")
-    return auth == f"Bearer {expected_token}"
+    if isinstance(arguments, dict):
+        return arguments
+
+    if isinstance(arguments, str):
+        if arguments.strip() == "":
+            return {}
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            return {}
+        except Exception:
+            return {}
+
+    return {}
+
+
+def get_tu_command():
+    tu_path = shutil.which("tu")
+
+    if tu_path:
+        return tu_path
+
+    return None
 
 
 def run_find_tools(query: str, limit: int = 5):
+    tu_cmd = get_tu_command()
+
+    if not tu_cmd:
+        return {
+            "status": "error",
+            "query": query,
+            "limit": limit,
+            "stdout": None,
+            "stderr": None,
+            "returncode": None,
+            "error": "ToolUniverse CLI command 'tu' was not found in Render environment. Check requirements.txt and deployment logs."
+        }
+
     cmd = [
-        "uvx",
-        "--from",
-        "tooluniverse",
-        "tu",
+        tu_cmd,
         "find",
         query,
         "--limit",
         str(limit)
     ]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=120
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
 
-    return {
-        "status": "ok" if result.returncode == 0 else "error",
-        "query": query,
-        "limit": limit,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "returncode": result.returncode
-    }
+        return {
+            "status": "ok" if result.returncode == 0 else "error",
+            "query": query,
+            "limit": limit,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "query": query,
+            "limit": limit,
+            "stdout": None,
+            "stderr": None,
+            "returncode": None,
+            "error": str(e)
+        }
 
 
-def run_tooluniverse_tool(tool_name: str, arguments: dict):
-    args_json = json.dumps(arguments, ensure_ascii=False)
+def run_tooluniverse_tool(tool_name: str, arguments: Any):
+    tu_cmd = get_tu_command()
+    clean_arguments = normalize_arguments(arguments)
+
+    if not tu_cmd:
+        return {
+            "status": "error",
+            "tool_name": tool_name,
+            "arguments": clean_arguments,
+            "stdout": None,
+            "stderr": None,
+            "returncode": None,
+            "error": "ToolUniverse CLI command 'tu' was not found in Render environment. Check requirements.txt and deployment logs."
+        }
+
+    args_json = json.dumps(clean_arguments, ensure_ascii=False)
 
     cmd = [
-        "uvx",
-        "--from",
-        "tooluniverse",
-        "tu",
+        tu_cmd,
         "run",
         tool_name,
         args_json
     ]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=180
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=240
+        )
 
-    return {
-        "status": "ok" if result.returncode == 0 else "error",
-        "tool_name": tool_name,
-        "arguments": arguments,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "returncode": result.returncode
-    }
+        return {
+            "status": "ok" if result.returncode == 0 else "error",
+            "tool_name": tool_name,
+            "arguments": clean_arguments,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "tool_name": tool_name,
+            "arguments": clean_arguments,
+            "stdout": None,
+            "stderr": None,
+            "returncode": None,
+            "error": str(e)
+        }
 
 
 @app.get("/", include_in_schema=False)
@@ -137,7 +203,8 @@ def root():
         "service": "tooluniverse-proxy",
         "openapi": "/openapi.json",
         "docs": "/docs",
-        "tools": ["/find_tools", "/run_tool"]
+        "tools": ["/find_tools", "/run_tool"],
+        "debug": "/debug"
     }
 
 
@@ -146,19 +213,21 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/debug", include_in_schema=False)
+def debug():
+    return {
+        "tu_path": shutil.which("tu"),
+        "uvx_path": shutil.which("uvx"),
+        "PATH": os.getenv("PATH")
+    }
+
+
 @app.get("/find_tools", include_in_schema=False)
 def find_tools_get(
     query: str = Query("EGFR drug target information"),
     limit: int = Query(5)
 ):
-    try:
-        return run_find_tools(query, limit)
-    except Exception as e:
-        return {
-            "status": "error",
-            "query": query,
-            "error": str(e)
-        }
+    return run_find_tools(query, limit)
 
 
 @app.post(
@@ -169,14 +238,7 @@ def find_tools_get(
     response_model=ToolResponse
 )
 def find_tools_post(payload: FindToolsRequest):
-    try:
-        return run_find_tools(payload.query, payload.limit)
-    except Exception as e:
-        return {
-            "status": "error",
-            "query": payload.query,
-            "error": str(e)
-        }
+    return run_find_tools(payload.query, payload.limit)
 
 
 @app.get("/run_tool", include_in_schema=False)
@@ -185,8 +247,11 @@ def run_tool_get():
         "status": "ok",
         "message": "run_tool endpoint is available. Use POST with JSON body.",
         "example_body": {
-            "tool_name": "Tool_Name_Here",
-            "arguments": {}
+            "tool_name": "PubMed_search_articles",
+            "arguments": {
+                "query": "EGFR cancer",
+                "max_results": 3
+            }
         }
     }
 
@@ -199,12 +264,4 @@ def run_tool_get():
     response_model=ToolResponse
 )
 def run_tool_post(payload: RunToolRequest):
-    try:
-        return run_tooluniverse_tool(payload.tool_name, payload.arguments)
-    except Exception as e:
-        return {
-            "status": "error",
-            "tool_name": payload.tool_name,
-            "arguments": payload.arguments,
-            "error": str(e)
-        }
+    return run_tooluniverse_tool(payload.tool_name, payload.arguments)
