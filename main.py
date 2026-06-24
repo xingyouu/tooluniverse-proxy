@@ -1,11 +1,18 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional
-import subprocess
+from typing import Any, Dict, Optional, List
 import json
-import os
-import shutil
+import traceback
+
+try:
+    from tooluniverse import ToolUniverse
+except Exception as e:
+    ToolUniverse = None
+    IMPORT_ERROR = str(e)
+else:
+    IMPORT_ERROR = None
+
 
 app = FastAPI(
     title="ToolUniverse Proxy",
@@ -40,7 +47,7 @@ class FindToolsRequest(BaseModel):
 class RunToolRequest(BaseModel):
     tool_name: str = Field(
         ...,
-        description="Exact ToolUniverse tool name returned by find_tools.",
+        description="Exact ToolUniverse tool name returned by toolfind.",
         examples=["PubMed_search_articles"]
     )
     arguments: Any = Field(
@@ -52,14 +59,17 @@ class RunToolRequest(BaseModel):
 
 class ToolResponse(BaseModel):
     status: str
-    stdout: Optional[str] = None
-    stderr: Optional[str] = None
-    returncode: Optional[int] = None
     query: Optional[str] = None
     limit: Optional[int] = None
     tool_name: Optional[str] = None
     arguments: Optional[Any] = None
+    result: Optional[Any] = None
+    tools: Optional[List[str]] = None
     error: Optional[str] = None
+    traceback: Optional[str] = None
+
+
+_TU = None
 
 
 def normalize_arguments(arguments: Any) -> Dict[str, Any]:
@@ -83,52 +93,94 @@ def normalize_arguments(arguments: Any) -> Dict[str, Any]:
     return {}
 
 
-def get_tu_command():
-    tu_path = shutil.which("tu")
+def get_tu():
+    global _TU
 
-    if tu_path:
-        return tu_path
+    if ToolUniverse is None:
+        raise RuntimeError(f"Failed to import tooluniverse: {IMPORT_ERROR}")
 
-    return None
+    if _TU is None:
+        tu = ToolUniverse()
+
+        # 不要先加载全部工具，Render 免费环境可能很慢。
+        # 先优先加载文献相关工具，够 showcase 用。
+        try:
+            tu.load_tools(
+                include_tools=[
+                    "PubMed_search_articles",
+                    "PubMed_get_article_details",
+                    "EuropePMC_search_articles",
+                    "EuropePMC_get_article_details"
+                ]
+            )
+        except TypeError:
+            # 兼容旧版本参数差异
+            tu.load_tools()
+
+        _TU = tu
+
+    return _TU
+
+
+def safe_tool_names(tu) -> List[str]:
+    try:
+        return tu.list_built_in_tools(mode="list_name")
+    except Exception:
+        try:
+            return list(tu.all_tools.keys())
+        except Exception:
+            return []
 
 
 def run_find_tools(query: str, limit: int = 5):
-    tu_cmd = get_tu_command()
-
-    if not tu_cmd:
-        return {
-            "status": "error",
-            "query": query,
-            "limit": limit,
-            "stdout": None,
-            "stderr": None,
-            "returncode": None,
-            "error": "ToolUniverse CLI command 'tu' was not found in Render environment. Check requirements.txt and deployment logs."
-        }
-
-    cmd = [
-        tu_cmd,
-        "find",
-        query,
-        "--limit",
-        str(limit)
-    ]
-
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
+        tu = get_tu()
+        all_names = safe_tool_names(tu)
+
+        query_lower = query.lower()
+
+        # 简单规则匹配，避免依赖 ToolUniverse 内置 embedding finder。
+        # 你的 showcase 先稳，不要把自己献祭给“智能工具发现”。
+        scored = []
+
+        for name in all_names:
+            name_lower = name.lower()
+            score = 0
+
+            if "pubmed" in name_lower:
+                score += 5
+            if "europepmc" in name_lower:
+                score += 4
+            if "search" in name_lower:
+                score += 3
+            if "article" in name_lower or "literature" in name_lower:
+                score += 2
+            if "drug" in query_lower and ("drug" in name_lower or "chembl" in name_lower):
+                score += 3
+            if "target" in query_lower and ("target" in name_lower or "opentarget" in name_lower):
+                score += 3
+            if "egfr" in query_lower and "pubmed" in name_lower:
+                score += 2
+
+            if score > 0:
+                scored.append((score, name))
+
+        scored.sort(reverse=True)
+
+        tools = [name for _, name in scored[:limit]]
+
+        if not tools:
+            tools = all_names[:limit]
 
         return {
-            "status": "ok" if result.returncode == 0 else "error",
+            "status": "ok",
             "query": query,
             "limit": limit,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
+            "tools": tools,
+            "result": {
+                "message": "Candidate ToolUniverse tools found.",
+                "recommended_next_step": "Use toolrun with one exact tool_name and JSON arguments."
+            }
         }
 
     except Exception as e:
@@ -136,52 +188,44 @@ def run_find_tools(query: str, limit: int = 5):
             "status": "error",
             "query": query,
             "limit": limit,
-            "stdout": None,
-            "stderr": None,
-            "returncode": None,
-            "error": str(e)
+            "error": str(e),
+            "traceback": traceback.format_exc()
         }
 
 
 def run_tooluniverse_tool(tool_name: str, arguments: Any):
-    tu_cmd = get_tu_command()
     clean_arguments = normalize_arguments(arguments)
 
-    if not tu_cmd:
-        return {
-            "status": "error",
-            "tool_name": tool_name,
-            "arguments": clean_arguments,
-            "stdout": None,
-            "stderr": None,
-            "returncode": None,
-            "error": "ToolUniverse CLI command 'tu' was not found in Render environment. Check requirements.txt and deployment logs."
-        }
-
-    args_json = json.dumps(clean_arguments, ensure_ascii=False)
-
-    cmd = [
-        tu_cmd,
-        "run",
-        tool_name,
-        args_json
-    ]
-
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=240
-        )
+        tu = get_tu()
+
+        # ToolUniverse 常见调用方式之一：tu.run({...})
+        # 如果当前版本不支持，会进入 except，再尝试其他方式。
+        try:
+            result = tu.run({
+                "name": tool_name,
+                "arguments": clean_arguments
+            })
+        except Exception:
+            try:
+                result = tu.run({
+                    "tool_name": tool_name,
+                    "arguments": clean_arguments
+                })
+            except Exception:
+                # 有些版本可能支持 execute_tool / run_tool，做兜底。
+                if hasattr(tu, "execute_tool"):
+                    result = tu.execute_tool(tool_name, clean_arguments)
+                elif hasattr(tu, "run_tool"):
+                    result = tu.run_tool(tool_name, clean_arguments)
+                else:
+                    raise
 
         return {
-            "status": "ok" if result.returncode == 0 else "error",
+            "status": "ok",
             "tool_name": tool_name,
             "arguments": clean_arguments,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
+            "result": result
         }
 
     except Exception as e:
@@ -189,10 +233,8 @@ def run_tooluniverse_tool(tool_name: str, arguments: Any):
             "status": "error",
             "tool_name": tool_name,
             "arguments": clean_arguments,
-            "stdout": None,
-            "stderr": None,
-            "returncode": None,
-            "error": str(e)
+            "error": str(e),
+            "traceback": traceback.format_exc()
         }
 
 
@@ -215,11 +257,27 @@ def health():
 
 @app.get("/debug", include_in_schema=False)
 def debug():
-    return {
-        "tu_path": shutil.which("tu"),
-        "uvx_path": shutil.which("uvx"),
-        "PATH": os.getenv("PATH")
-    }
+    try:
+        tu = get_tu()
+        names = safe_tool_names(tu)
+        return {
+            "status": "ok",
+            "tooluniverse_imported": ToolUniverse is not None,
+            "import_error": IMPORT_ERROR,
+            "loaded_tool_count": len(names),
+            "first_tools": names[:10],
+            "has_run": hasattr(tu, "run"),
+            "has_execute_tool": hasattr(tu, "execute_tool"),
+            "has_run_tool": hasattr(tu, "run_tool")
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "tooluniverse_imported": ToolUniverse is not None,
+            "import_error": IMPORT_ERROR,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 
 @app.get("/find_tools", include_in_schema=False)
