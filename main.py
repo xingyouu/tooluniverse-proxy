@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 import sys
 import subprocess
-import traceback
 
 app = FastAPI(
     title="ToolUniverse Proxy",
@@ -18,7 +17,7 @@ def root():
         "status": "ok",
         "service": "tooluniverse-proxy",
         "health": "/health",
-        "debug": "/debug"
+        "safe_debug": "/safe_debug"
     }
 
 
@@ -27,12 +26,12 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/debug")
-def debug():
+@app.get("/safe_debug")
+def safe_debug():
     result = {
         "status": "ok",
         "python": sys.executable,
-        "python_version": sys.version
+        "python_version": sys.version.split()[0]
     }
 
     pip_show = subprocess.run(
@@ -41,41 +40,34 @@ def debug():
         text=True
     )
 
-    result["pip_show_tooluniverse_stdout"] = pip_show.stdout
-    result["pip_show_tooluniverse_stderr"] = pip_show.stderr
-    result["pip_show_tooluniverse_returncode"] = pip_show.returncode
+    result["tooluniverse_installed"] = pip_show.returncode == 0
 
     try:
         import tooluniverse
-
         result["tooluniverse_imported"] = True
-        result["tooluniverse_module_file"] = getattr(tooluniverse, "__file__", None)
 
         try:
             from tooluniverse import ToolUniverse
-
             result["ToolUniverse_class_imported"] = True
 
             tu = ToolUniverse()
             result["ToolUniverse_instance_created"] = True
 
-            result["ToolUniverse_methods_sample"] = [
+            result["methods_sample"] = [
                 m for m in dir(tu)
                 if "tool" in m.lower()
                 or "run" in m.lower()
                 or "execute" in m.lower()
                 or "load" in m.lower()
                 or "call" in m.lower()
-            ][:100]
+            ][:50]
 
         except Exception as e:
             result["ToolUniverse_class_imported"] = False
             result["ToolUniverse_error"] = str(e)
-            result["ToolUniverse_traceback"] = traceback.format_exc()
 
     except Exception as e:
         result["tooluniverse_imported"] = False
         result["import_error"] = str(e)
-        result["import_traceback"] = traceback.format_exc()
 
     return result
